@@ -19,13 +19,45 @@ continue running.
 """
 
 import logging
+import os
+import sys
+import traceback
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
+from logging import Formatter
 from logging import Handler
 from logging import LogRecord
-from logging import Formatter
-import os
-from datetime import datetime, timezone, timedelta
 
 import requests
+
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger = Logger().init()
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+class TelegramHandler(Handler):
+    def emit(self, record: LogRecord) -> None:
+        log_entry = self.format(record)
+        token = os.environ["TG_TOKEN"]
+        chat_ids = os.environ["TG_CHATS"].split(",")
+        notifications = False
+        if record.levelno < 30:
+            notifications = True
+        for chat in chat_ids:
+            requests.get(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                params={
+                    "chat_id": chat,
+                    "text": log_entry,
+                    "parse_mode": "markdown",
+                    "disable_notification": notifications,
+                },
+            )
 
 
 class BaseFormatter(Formatter):
@@ -41,7 +73,24 @@ class BaseFormatter(Formatter):
         )
         fmt = f"[{levelname}] ({module}): {ts} {message}"
         if record.exc_info:
-            fmt += f"\n{record.exc_info[1].__repr__()}"
+            fmt += f"\n{''.join(traceback.format_exception(*record.exc_info))}"
+        return fmt
+
+
+class MarkdownFormatter(Formatter):
+    def format(self, record: LogRecord) -> str:
+        message = record.msg
+        levelname = record.levelname
+        module = record.module
+        timestamp = datetime.utcfromtimestamp(record.created)
+        ts = (
+            timestamp.replace(tzinfo=timezone.utc)
+            .astimezone(tz=timezone(timedelta(hours=3)))
+            .strftime("%d.%m.%Y %H:%M:%S")
+        )
+        fmt = f"*[{levelname}]* ({module}): {ts} {message}"
+        if record.exc_info:
+            fmt += f"\n```{''.join(traceback.format_exception(*record.exc_info))}```"
         return fmt
 
 
@@ -51,10 +100,17 @@ class Logger:
         if self.logger.hasHandlers():
             self.logger.handlers.clear()
 
+        sys.excepthook = handle_exception
+
     def init(self):
         self.logger.setLevel("INFO")
         console = logging.StreamHandler()
-        formatter = BaseFormatter()
-        console.setFormatter(formatter)
+        base_formatter = BaseFormatter()
+        console.setFormatter(base_formatter)
         self.logger.addHandler(console)
+        if "PRODUCTION" in os.environ:
+            tg = TelegramHandler()
+            md_formatter = MarkdownFormatter()
+            tg.setFormatter(md_formatter)
+            self.logger.addHandler(tg)
         return self.logger
